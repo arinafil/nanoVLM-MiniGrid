@@ -1,0 +1,381 @@
+
+```markdown
+# NanoVLM-MiniGrid: Управление агентом в Grid World с помощью Vision-Language модели
+
+## Описание проекта
+
+Данный проект реализует пайплайн дообучения vision-language модели NanoVLM для управления агентом в среде MiniGrid EmptyEnv. Агент находится в сетчатом мире и должен добраться до зелёной клетки-цели. Модель принимает на вход RGB-изображение текущего состояния среды (полный render игрового поля) и выбирает одно из трёх действий: left, right или forward.
+
+В рамках проекта сравниваются три подхода к обучению. Первый подход — SFT (supervised fine-tuning) на экспертных траекториях, где модель учится имитировать оптимальную политику BFS-эксперта. Второй подход — GRPO (Group Relative Policy Optimization) с прямым выводом действия, где модель дообучается через взаимодействие со средой и получение награды за достижение цели. Третий подход — GRPO с генерацией текстового описания ситуации перед выбором действия, что добавляет интерпретируемость и потенциально улучшает качество решений за счёт механизма chain-of-thought рассуждений.
+
+Проект выполнен в рамках курсового задания, полный текст которого приведён в конце этого документа.
+
+## Быстрый старт
+
+### Запуск в Google Colab
+
+Рекомендуемый способ запуска — через Google Colab, который предоставляет бесплатный доступ к GPU NVIDIA T4 с 16GB видеопамяти. Этого достаточно для всех экспериментов.
+
+[![Open In Colab]()
+
+После открытия ноутбука необходимо выбрать GPU-рантайм через меню Runtime, затем Change runtime type, затем T4 GPU. После этого ячейки запускаются последовательно от первой до девятой. Общее время выполнения на T4 составляет примерно 80 минут. Каждая ячейка самодостаточна и содержит все необходимые определения.
+
+### Локальный запуск
+
+```bash
+git clone https://github.com/arinafil/nanoVLM-MiniGrid.git
+cd nanoVLM-MiniGrid
+pip install -r requirements.txt
+jupyter notebook train_notebook.ipynb
+```
+
+Для локального запуска потребуется NVIDIA GPU с не менее чем 16GB видеопамяти, CUDA версии 11.8 или выше и Python 3.10 или выше.
+
+## Структура репозитория
+
+```
+nanoVLM-MiniGrid/
+├── README.md                 
+├── train_notebook.ipynb            
+├── requirements.txt          
+├── report.pdf                
+└── results/                  
+    ├── plots/                — графики обучения и сравнения
+    │   ├── sft_baseline.png
+    │   ├── grpo_action.png
+    │   ├── grpo_text.png
+    │   └── final_comparison.png
+    └── checkpoints/          — сохранённые веса моделей
+        ├── sft_baseline.pt
+        ├── grpo_action.pt
+        └── grpo_text.pt
+```
+
+## Архитектура
+
+### NanoVLM
+
+NanoVLM — это минимальная vision-language модель от Hugging Face общим размером 228 миллионов параметров. Она состоит из трёх компонентов, соединённых последовательно.
+
+Первый компонент — vision encoder SigLIP2-base-patch16-512 на 86 миллионов параметров. Он принимает RGB-изображение размером 512 на 512 пикселей и разбивает его на патчи размером 16 на 16, получая сетку 32 на 32, то есть 1024 патча. Каждый патч кодируется в 768-мерный вектор. SigLIP2 обучен на парах изображение-текст и хорошо извлекает визуальные признаки без дополнительной настройки, поэтому в наших экспериментах он заморожен.
+
+Второй компонент — Modality Projection на 7 миллионов параметров. Он решает две задачи одновременно. Первая — сжатие количества токенов с помощью Pixel Shuffle с фактором 4, который группирует соседние патчи и уменьшает 1024 патча до 64 токенов. Вторая — линейная проекция из размерности vision encoder в размерность языковой модели (576). Этот компонент инициализирован случайно и обучается с повышенным learning rate.
+
+Третий компонент — языковая модель SmolLM2-135M на 135 миллионов параметров. Это авторегрессионный трансформер-декодер с 30 блоками, hidden_dim=576, 9 attention heads и 3 KV-heads (Grouped Query Attention). Модель предобучена на текстовых данных и дообучается с низким learning rate.
+
+Общая схема работы:
+
+```
+RGB Image (render среды)
+       │
+       ▼
+┌─────────────────────────┐
+│  Vision Encoder          │  SigLIP2-base (86M, FROZEN)
+│  512×512 → 1024 patches │  → [1024, 768]
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│  Modality Projector      │  Pixel Shuffle + Linear (7M, TRAINABLE)
+│  1024 → 64 tokens        │  → [64, 576]
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│  Language Model          │  SmolLM2-135M (135M, TRAINABLE)
+│  token_embd + img_embd  │  30 transformer blocks
+│  → logits [T, 49218]    │
+└────────────┬────────────┘
+             │
+             ▼
+    Выбор действия из 3 токенов
+```
+
+### Важная техническая особенность: lm_head при инференсе
+
+В оригинальном nanoVLM метод `forward()` применяет `lm_head` (проекцию hidden→vocab) только при наличии targets (при обучении). При инференсе возвращаются raw hidden states размерности 576 вместо logits размерности 49218, что приводит к генерации мусора.
+
+Решение — функция `full_logits()`, которая всегда применяет `decoder.head()`:
+
+```python
+def full_logits(model, input_ids, images):
+    images_tensor = model._process_images(images, input_ids.device)
+    token_embd = model.decoder.token_embedding(input_ids)
+    if images_tensor is not None:
+        image_embd = model.vision_encoder(images_tensor)
+        image_embd = model.MP(image_embd)
+        token_embd = model._replace_img_tokens_with_embd(input_ids, token_embd, image_embd)
+    hidden, _ = model.decoder(token_embd)
+    return model.decoder.head(hidden)  # ВСЕГДА применяем lm_head
+```
+
+### Constrained Decoding: выбор действия
+
+Вместо авторегрессивной генерации произвольного текста (которая часто даёт мусор у малых моделей) используется constrained decoding — выбор из трёх заранее определённых action-токенов:
+
+```python
+@torch.no_grad()
+def generate_action(model, pil_img):
+    logits = full_logits(model, prompt_ids, images)
+    last = logits[0, -1, :]  # logits последней позиции
+    scores = [last[ID_left], last[ID_right], last[ID_forward]]
+    return argmax(scores)
+```
+
+Это гарантирует, что модель всегда выдаёт валидное действие и позволяет корректно оценивать обученность — по относительным logits трёх action-токенов.
+
+## MiniGrid EmptyEnv
+
+### Описание среды
+
+MiniGrid EmptyEnv — это простая среда в виде сетчатого мира, окружённого стенами. Внутри нет препятствий, только агент (красный треугольник с направлением взгляда) и зелёная клетка-цель. Агент стартует в случайной позиции с случайным направлением и должен достичь цели.
+
+### Наблюдения
+
+В проекте используется полный RGB render среды (`render_mode='rgb_array'`), а не частичное эгоцентрическое наблюдение 7×7. Это даёт модели полную информацию о расположении агента и цели, что упрощает задачу и позволяет сфокусироваться на обучении VLM.
+
+### Пространство действий
+
+| ID | Действие | Описание |
+|----|----------|----------|
+| 0 | `left` | Повернуться на 90° влево |
+| 1 | `right` | Повернуться на 90° вправо |
+| 2 | `forward` | Сделать шаг вперёд в направлении взгляда |
+
+### Награда
+
+Награда назначается только при достижении цели: `reward = 1 - 0.9 * (step_count / max_steps)`. Если агент не достигает цели за отведённое количество шагов, награда равна нулю (sparse reward).
+
+### Размеры карт
+
+| Среда | Размер | Макс. шагов | Назначение |
+|-------|--------|-------------|------------|
+| `MiniGrid-Empty-6x6-v0` | 6×6 | 25 | Простая, тест базовой работоспособности |
+| `MiniGrid-Empty-8x8-v0` | 8×8 | 40 | Основная, сбор данных и обучение |
+| `MiniGrid-Empty-16x16-v0` | 16×16 | 60 | Сложная, тест generalization |
+
+## BFS-эксперт
+
+### Алгоритм
+
+В качестве эксперта для сбора обучающих данных используется поиск в ширину (BFS) по полному состоянию среды. BFS работает с состоянием агента, описываемым как тройка (x, y, направление), где направление принимает одно из четырёх значений. На каждом шаге BFS строит граф переходов:
+
+- **forward**: если клетка впереди свободна → перемещение `(x,y) → (x+dx, y+dy)`
+- **left**: поворот → `direction = (direction - 1) % 4`
+- **right**: поворот → `direction = (direction + 1) % 4`
+
+BFS находит кратчайшую последовательность действий до цели и возвращает первое действие.
+
+### Почему BFS
+
+BFS был выбран по нескольким причинам. Он детерминированный и всегда находит оптимальный (кратчайший) путь. Он прост в реализации и не требует обучения. На пустых картах EmptyEnv он имеет стопроцентный success rate, что даёт чистый обучающий сигнал для SFT без шума от субоптимальных решений.
+
+### Статистика данных
+
+| Набор | Среда | Эпизодов | Пар (obs, action) |
+|-------|-------|----------|-------------------|
+| Train | Empty-8x8 | 40 | ~420 |
+| Train | Empty-6x6 | 20 | ~140 |
+| Val | Empty-8x8 | 8 | ~100 |
+| **Итого train** | | **60** | **~560** |
+
+Распределение действий (типичное):
+- `forward`: ~60% (большинство шагов — движение к цели)
+- `left`: ~20% (повороты для корректировки направления)
+- `right`: ~20%
+
+## Методы обучения
+
+### Метод 1: SFT Baseline
+
+SFT-бэйзлайн соответствует пункту 1 задания. Модель учится предсказывать оптимальное действие по изображению среды.
+
+**Формат входа:**
+```
+<|im_start|>user
+<image_tokens × 64> You control an agent in a grid world.
+It must reach the green goal.
+What action? Answer one word: left, right, or forward.<|im_end|>
+<|im_start|>assistant
+```
+
+**Формат выхода (при обучении):**
+```
+forward<|im_end|>\n
+```
+
+При обучении маскируются первые 103 токена (промпт), loss считается только на позициях ответа (action-токен + end tokens). При инференсе используется constrained decoding — argmax по logits трёх action-токенов на позиции -1.
+
+**Гиперпараметры:**
+
+| Параметр | Значение |
+|----------|----------|
+| Эпохи | 4 |
+| Batch size | 4 |
+| LR Modality Projector | 5e-4 |
+| LR Decoder | 5e-5 |
+| Weight decay | 1e-4 |
+| Scheduler | CosineAnnealing |
+| Gradient clipping | 1.0 |
+| Vision encoder | Frozen |
+
+### Метод 2: GRPO Direct Action
+
+GRPO с прямым выводом действия соответствует пункту 2 задания. Политика инициализируется весами SFT-модели и дообучается через взаимодействие со средой.
+
+**Алгоритм GRPO (упрощённый):**
+
+```
+Для каждой итерации:
+  1. Запустить G=3 rollouts в MiniGrid-Empty-8x8
+  2. На каждом шаге: сэмплировать действие из 3 action-токенов с temperature=0.5
+  3. Reward: 1.0 если достигли цели, 0.0 иначе
+  4. Advantage = (reward - mean_group) / std_group
+  5. Пропустить группу если std ≈ 0 (все одинаковые)
+  6. Loss = -Σ log_prob(sampled_action) × advantage
+  7. Gradient step с clipping
+```
+
+Ключевое отличие от стандартного REINFORCE — advantage нормализуется по группе rollouts, что уменьшает дисперсию градиента.
+
+**Sampling действий:**
+```python
+# Только из 3 action-токенов, не из всего vocab!
+act_logits = [logits[0,-1,ID_left], logits[0,-1,ID_right], logits[0,-1,ID_forward]]
+act_logits = act_logits / temperature
+probs = softmax(act_logits)
+action = sample(Categorical(probs))
+```
+
+**Гиперпараметры:**
+
+| Параметр | Значение |
+|----------|----------|
+| Итерации | 15 |
+| Group size | 3 |
+| Max steps per episode | 40 |
+| Temperature (rollout) | 0.5 |
+| LR | 1e-5 |
+| Max replay steps | 10 |
+| Инициализация | SFT checkpoint |
+
+### Метод 3: GRPO Text+Action
+
+GRPO с текстом и действием соответствует пункту 3 задания. Модель генерирует текстовое описание перед действием.
+
+**Изменённый промпт:**
+```
+You control an agent in a grid world. It must reach the green goal.
+Briefly describe what you see, then choose: left, right, or forward.
+```
+
+**Пример генерации:**
+```
+Green goal is to the right. forward
+```
+
+**Отличия от GRPO-act:**
+- Авторегрессивная генерация до 12 токенов (не 1)
+- Действие извлекается парсером `parse_action()` из текста
+- Градиент по последнему токену каждого шага (приближение)
+- Инициализация от SFT checkpoint (не от GRPO-act)
+
+**Извлечение действия:**
+```python
+def parse_action(text):
+    t = text.lower().strip()
+    if t in NAME_TO_ACTION: return NAME_TO_ACTION[t]
+    for name in ["forward", "right", "left"]:
+        if name in t: return NAME_TO_ACTION[name]
+    return 2  # default: forward
+```
+
+## Оценка и метрики
+
+### Success Rate (SR)
+
+Основная метрика — доля эпизодов, в которых агент достиг цели:
+
+```
+SR = (количество успешных эпизодов) / (общее количество эпизодов)
+```
+
+### Протокол оценки
+
+- Фиксированные seed (50000+ep) для воспроизводимости
+- Детерминированный выбор (argmax) при eval
+- Стохастический выбор (sampling) при GRPO training
+- 3-5 эпизодов при промежуточной оценке, 5-10 при финальной
+- Три среды: 6×6 (простая), 8×8 (in-distribution), 16×16 (generalization)
+
+## Результаты
+
+### Сводная таблица
+
+| Метод | 6×6 SR | 8×8 SR | 16×16 SR |
+|-------|--------|--------|----------|
+| SFT baseline | [___] | [___] | [___] |
+| GRPO action | [___] | [___] | [___] |
+| GRPO text+action | [___] | [___] | [___] |
+
+Актуальные результаты генерируются при запуске ноутбука и сохраняются в `results/plots/final_comparison.png`.
+
+### Графики
+
+Ноутбук автоматически генерирует четыре графика:
+- `sft_baseline.png` — loss curves и SR по эпохам SFT
+- `grpo_action.png` — loss, training SR и eval SR для GRPO-act
+- `grpo_text.png` — аналогично для GRPO-text
+- `final_comparison.png` — сводное сравнение всех трёх методов
+
+## Управление памятью
+
+T4 GPU имеет 16GB видеопамяти, что накладывает ограничения. Решения:
+
+1. **Последовательное обучение**: модели удаляются между этапами (`del model; gc.collect(); torch.cuda.empty_cache()`)
+2. **State dict на CPU**: веса SFT-модели сохраняются на CPU перед загрузкой GRPO
+3. **PNG-буферы**: изображения для GRPO replay сжимаются в PNG в памяти
+4. **Frozen vision encoder**: 86M параметров не участвуют в backward pass
+
+## Известные особенности и решения
+
+### 1. nanoVLM lm_head при инференсе
+**Проблема**: `forward()` возвращает hidden states (dim=576) вместо logits (dim=49218) без targets.
+**Решение**: `full_logits()` — всегда применяет `decoder.head()`.
+
+### 2. Авторегрессивная генерация мусора
+**Проблема**: малая модель (135M) при свободной генерации выдаёт `\nWhat action` вместо действия, потому что первый токен после промпта — `\n` с наивысшим logit.
+**Решение**: constrained decoding — argmax по 3 action-токенам.
+
+### 3. Chat template формат
+**Проблема**: answer начинается с позиции 103, между `assistant\n` и ответом chat template вставляет разделители.
+**Решение**: точное определение PROMPT_LEN и маскирование label[:PROMPT_LEN] = -100.
+
+### 4. process_image возвращает tuple
+**Проблема**: `nanoVLM.process_image()` возвращает `(tensor, grid_size)`.
+**Решение**: обёртка извлекает только тензор.
+
+## Реккомендации для улучшения решения 
+
+1. **Масштабирование GRPO** — 100+ итераций, group_size=8-16 для лучшей оценки advantage
+2. **KL-регуляризация** — KL-penalty между policy и reference model для стабильности
+3. **PPO сравнение** — классический PPO с value network vs GRPO
+4. **Curriculum learning** — постепенное увеличение размера карты (4×4 → 16×16)
+5. **Сложные среды** — DoorKey, MultiRoom, LavaCrossing
+6. **Полный Chain-of-Thought** — reward shaping за качество текстовых описаний
+7. **Многошаговый градиент** — gradient по всей траектории, не только по отдельным шагам
+8. **Аугментация данных** — повороты изображений, вариации цветов
+9. **Больший VLM** — SmolLM2-360M или 1.7B для лучшего понимания сцены
+10. **Memory/History** — подача истории последних K наблюдений для навигации
+
+## Зависимости
+
+Проект использует PyTorch 2.0+, transformers 4.40+ для загрузки SigLIP2 и SmolLM2, gymnasium и minigrid для среды, matplotlib для визуализации, numpy и Pillow.
+
+## Ссылки
+
+- [MiniGrid EmptyEnv](https://minigrid.farama.org/environments/minigrid/EmptyEnv/)
+- [NanoVLM](https://github.com/huggingface/nanoVLM)
+- [GRPO (DeepSeek-Math)](https://arxiv.org/abs/2402.03300)
+- [SigLIP2](https://huggingface.co/google/siglip2-base-patch16-512)
+- [SmolLM2](https://huggingface.co/HuggingFaceTB/SmolLM2-135M)
