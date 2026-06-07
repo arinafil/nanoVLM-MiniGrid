@@ -1,5 +1,5 @@
 
-```markdown
+
 # NanoVLM-MiniGrid: Управление агентом в Grid World с помощью Vision-Language модели
 
 ## Описание проекта
